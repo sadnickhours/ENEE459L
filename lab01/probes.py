@@ -143,6 +143,16 @@ def probe_memory_total_kb(root: Path = Path("/")) -> dict[str, Any]:
     ever sees the pool. Students are expected to notice and to explain it in
     their report rather than round it up.
     """
+    src = "/proc/meminfo"
+    raw = read_text(root, src)
+
+    if not raw:
+        return unknown(src, "no /proc/meminfo — not a Jetson, or /proc not mounted")
+    
+    m = re.search(r"^MemTotal:\s+(\d+)\s*kB", raw)
+
+    if not m:
+        return unknown(src, "MemTotal line not found in /proc/meminfo")
     
     return {"value": int(m.group(1)), "source": src, "status": "ok"}
 
@@ -159,9 +169,40 @@ def probe_root_source(root: Path = Path("/")) -> dict[str, Any]:
     /proc/mounts is preferred over `findmnt` because it needs no external
     binary and no elevation, and because it is what findmnt reads anyway.
     """
-    
-    return unknown(src, "no root mount entry found in mount table")
 
+    src = "/proc/mounts"
+    raw = read_text(root, src)
+
+    if not raw:
+        return unknown(src, "Could not read /proc/mounts")
+
+    for line in raw.splitlines():
+        fields = line.split()
+
+        if len(fields) < 2:
+            continue
+
+        device = fields[0]
+        mountpoint = fields[1]
+
+        if mountpoint != "/":
+            continue
+
+        if device.startswith("/dev/nvme"):
+            kind = "nvme"
+        elif device.startswith("/dev/mmcblk") or device.startswith("/dev/sd"):
+            kind = "ssd"
+        else:
+            kind = "unknown"
+
+        return {
+            "value": device,
+            "kind": kind,
+            "source": src,
+            "status": "ok"
+        }
+
+    return unknown(src, "Root mount not found")
 
 def probe_nvme_present(root: Path = Path("/")) -> dict[str, Any]:
     """Is there an NVMe device visible as a block device at all?
@@ -171,12 +212,32 @@ def probe_nvme_present(root: Path = Path("/")) -> dict[str, Any]:
     is what lets the troubleshooting tree in the lab guide send a student to
     the right branch.
     """
-    
+
+    src = "/sys/block/nvme0n1"
+
+    nvme_path = Path(root) / "sys/block/nvme0n1"
+
+    if not nvme_path.exists():
+        return {
+            "value": False,
+            "model": "",
+            "source": src,
+            "status": "ok"
+        }
+
+    model_src = "/sys/block/nvme0n1/device/model"
+    raw = read_text(root, model_src)
+
+    if not raw:
+        return unknown(src, "Could not read NVMe model")
+
+    model = re.sub(r"\s+", " ", raw).strip()
+
     return {
-        "value": ,
-        "model": ,
-        "source": ,
-        "status": "ok",
+        "value": True,
+        "model": model,
+        "source": src,
+        "status": "ok"
     }
 
 
@@ -191,14 +252,51 @@ def probe_pcie_link(root: Path = Path("/"), lspci_output: str | None = None) -> 
     `lspci_output` exists so the tests can drive this without root or hardware.
     In normal use it is None and the probe shells out.
     """
-        
+
+    global negotiated, capability
+
+    if lspci_output is None:
+        var = run(["lspci", "-vv"])
+    else:
+        var = lspci_output
+
+    if not var:
+        return unknown(
+            "lspci",
+            "lspci not found or failed to run — not a Jetson, or lspci not installed"
+        )
+
+    negotiated = None
+    capability = None
+
+    for line in var.splitlines():
+        if "LnkCap:" in line and capability is None:
+            capability = _parse_link_line(line)
+
+        elif "LnkSta:" in line and negotiated is None:
+            negotiated = _parse_link_line(line)
+
+        if negotiated is not None and capability is not None:
+            break
+
+    if negotiated is None or capability is None:
+        return unknown(
+            "lspci",
+            "could not find both LnkSta and LnkCap in lspci output"
+        )
+
+    interpretation = generate_interpretation_string(
+        negotiated["gts"],
+        capability["gts"]
+    )
+
     return {
-        "value":,
-        "negotiated": ,
-        "capability": ,
-        "interpretation": ,
-        "source": ,
+        "value": negotiated["gts"],
+        "negotiated": negotiated,
+        "capability": capability,
+        "source": "lspci -vv",
         "status": "ok",
+        "interpretation": interpretation,
     }
 
 
@@ -210,11 +308,65 @@ def probe_thermal_zones(root: Path = Path("/")) -> dict[str, Any]:
     than once, and it is a good, cheap lesson in reading units before reading
     numbers.
     """
+
+    src = "/sys/class/thermal/thermal_zone*/temp"
+
+    base = Path(root) / "sys/class/thermal"
+    zone_paths = list(base.glob("thermal_zone*"))
+
+    if not zone_paths:
+        return unknown(src, "no thermal zones found")
+
+    zones = []
+    max_temp = None
+
+    for zone_path in sorted(zone_paths):
+        zone_name = zone_path.name
+
+        type_path = zone_path / "type"
+        temp_path = zone_path / "temp"
+
+        try:
+            with open(type_path, "rb") as f:
+                type_data = f.read()
+
+            with open(temp_path, "rb") as f:
+                temp_data = f.read()
+
+            if type_data is None or temp_data is None:
+                continue
+
+            zone_type = type_data.decode(errors="replace").strip("\x00").strip()
+            raw_temp = temp_data.decode(errors="replace").strip("\x00").strip()
+
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        if not zone_type or not raw_temp:
+            continue
+
+        try:
+            temp_c = int(raw_temp) / 1000
+        except ValueError:
+            continue
+
+        zones.append({
+            "zone": zone_name,
+            "type": zone_type,
+            "temp_c": temp_c
+        })
+
+        if max_temp is None or temp_c > max_temp:
+            max_temp = temp_c
+
+    if not zones:
+        return unknown(src, "no readable thermal zones found")
+
     return {
-        "value": ,
-        "zones": ,
-        "source": ,
-        "status": "ok",
+        "value": max_temp,
+        "zones": zones,
+        "source": src,
+        "status": "ok"
     }
 
 
@@ -226,11 +378,39 @@ def probe_power_mode(root: Path = Path("/"), nvpmodel_output: str | None = None)
     same model are usually reporting different power modes, and without this
     field there is no way to find that out after the fact.
     """
+
+    if nvpmodel_output is None:
+        var = run(["nvpmodel", "-q"])
+    else:
+        var = nvpmodel_output
+
+    if not var:
+        return unknown(
+            "nvpmodel",
+            "nvpmodel not found or failed to run — not a Jetson, or nvpmodel not installed"
+        )
+
+    mode_name = re.search(r"NV Power Mode:\s*(.+)", var)
+
+    if not mode_name:
+        return unknown(
+            "nvpmodel",
+            "nvpmodel output did not contain power mode information"
+        )
+
+    mode_id = re.search(r"^\s*(\d+)\s*$", var, re.MULTILINE)
+
+    if not mode_id:
+        return unknown(
+            "nvpmodel",
+            "nvpmodel output did not contain a standalone numeric mode ID"
+        )
+
     return {
-        "value": ,
-        "mode_id": ,
-        "source": ,
-        "status": "ok",
+        "value": mode_name.group(1),
+        "mode_id": int(mode_id.group(1)),
+        "source": "nvpmodel -q",
+        "status": "ok"
     }
 
 ## for debugging - uncomment the following lines for debugging.
@@ -253,4 +433,3 @@ if __name__ == "__main__":
     path = "system_report.json"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=4)
-
