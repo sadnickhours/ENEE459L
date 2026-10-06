@@ -14,129 +14,322 @@ from graph import (
 
 FLOPS_PER_MAC = 2
 
-# The conventions `to_flops` will honour by name. Anything else is unknown
-# rather than an assumption, because the whole point of the parameter is that
-# the caller has to say which one they mean.
 FLOP_CONVENTIONS = {
     "mac_is_two_flops": 2,
     "mac_is_one_flop": 1,
 }
 
-# Batch normalisation holds two learnable vectors per channel (scale and shift)
-# and two non-learnable ones (running mean and variance). The first pair are
-# parameters; the second pair are buffers. Both are in the file.
+
 BN_PARAMS_PER_CHANNEL = 2
 BN_BUFFERS_PER_CHANNEL = 2
 
-# Buffers are kept in FP32 even when the weights are not. Halving them saves
-# nothing worth having and a denormal running variance is a real failure mode.
 BUFFER_DTYPE = "fp32"
 
-# Below this many models there is no line to fit and no residual to report.
 MIN_MODELS_FOR_FIT = 3
-
-# Two floats are the same MAC count when they are the same integer. There is no
-# tolerance here on purpose: MAC counts are integers, and a tolerance would let
-# two genuinely different architectures be reported as tied.
 TIE_EXACT = True
 
 
 # ===========================================================================
-# 1. How many numbers are stored
+# 1. Counting learnable parameters
 # ===========================================================================
+
 
 def count_parameters(graph: Graph) -> dict[str, Any]:
-    pass
+    """Count learnable parameters in every layer and in the graph."""
+
+    per_layer = {}
+    total = 0
+
+    for ly in graph.layers:
+        per_layer[ly.name] = _layer_parameters(ly)
+        total += per_layer[ly.name]
+
+    return computed(
+        value=total,
+        source="count_parameters",
+        per_layer=per_layer,
+        includes_bias=True,
+        excludes_bn_buffers=True,
+        bn_params_per_channel=BN_PARAMS_PER_CHANNEL,
+    )
+
+
+def _layer_parameters(ly: Layer) -> int:
+    """Return the number of learnable parameters in one layer."""
+
+    if ly.kind == "conv":
+        cout = ly.out_shape[0]
+        cin = ly.in_shape[0]
+
+        if ly.kernel is None:
+            kh, kw = 1, 1
+        else:
+            kh, kw = ly.kernel
+
+        nweights = cout * (cin // ly.groups) * kh * kw
+
+        if ly.bias:
+            nweights += cout
+
+        return nweights
+
+    elif ly.kind == "linear":
+        fout = ly.out_shape[0]
+        fin = ly.in_shape[0]
+
+        nweights = fout * fin
+
+        if ly.bias:
+            nweights += fout
+
+        return nweights
+
+    elif ly.kind == "bn":
+        return BN_PARAMS_PER_CHANNEL * ly.out_shape[0]
+
+    else:
+        return 0
 
 
 # ===========================================================================
-# 2. What those numbers weigh, which is not the size of the file
+# 2. Stored model size
 # ===========================================================================
 
 
 def model_size_bytes(graph: Graph) -> dict[str, Any]:
-    """Bytes of stored tensors: parameters plus buffers, at their own dtypes.
+    """Calculate stored parameter and persistent-buffer memory in bytes."""
 
-    Lecture 04 slide 8 gives the formula as `#Parameters × bit width` and slide
-    9 spends a page on why the file on disk is not that number. Three reasons,
-    two of which this function has to get right:
+    per_dtype = {}
+    per_layer = {}
+    buffer_bytes = 0.0
 
-      * a model is not stored in one dtype. `Layer.weight_dtype` is per layer
-        and a network with FP16 weights and FP32 normalisation is completely
-        ordinary. Multiplying a single total by a single bit width is the
-        mistake, and on these four descriptions it is worth several per cent
-      * buffers are in the file. Batch norm's running statistics are two
-        vectors per channel that no optimiser ever touched, and they are still
-        bytes you have to ship
-      * the container is in the file too — the pickle framing, the state-dict
-        keys, the archive directory. This function does *not* try to model
-        that, and it says so in `container_overhead_excluded` rather than
-        quietly letting the caller assume it did
+    for ly in graph.layers:
+        # Learnable parameters
+        n = _layer_parameters(ly)
 
-    Returns a `computed` finding whose value is bytes, with the per-dtype
-    breakdown that makes the first bullet checkable.
-    """
-    pass
+        param_bytes = n * dtype_bytes(ly.weight_dtype)
+
+        per_dtype[ly.weight_dtype] = (
+            per_dtype.get(ly.weight_dtype, 0.0) + param_bytes
+        )
+
+        layer_bytes = param_bytes
+
+        # Batch-normalization running mean and variance
+        if ly.kind == "bn":
+            buffers = BN_BUFFERS_PER_CHANNEL * ly.out_shape[0]
+
+            buff_bytes = buffers * dtype_bytes(BUFFER_DTYPE)
+
+            buffer_bytes += buff_bytes
+
+            per_dtype[BUFFER_DTYPE] = (
+                per_dtype.get(BUFFER_DTYPE, 0.0) + buff_bytes
+            )
+
+            layer_bytes += buff_bytes
+
+        per_layer[ly.name] = layer_bytes
+
+    total = sum(per_layer.values())
+
+    return computed(
+        value=total,
+        source="model_size_bytes",
+        per_layer=per_layer,
+        per_dtype=per_dtype,
+        buffer_bytes=buffer_bytes,
+        container_overhead_excluded=True,
+    )
+
 
 # ===========================================================================
-# 3. The memory nobody puts in the table
+# 3. Activation footprint and liveness
 # ===========================================================================
+
 
 def count_activations(graph: Graph) -> dict[str, Any]:
-    """Total and peak activation footprint, in elements and in bytes.
+    """Calculate total activation production and peak resident memory."""
 
-    UNC COMP 790-150 Lec 2 p. 70 gives AlexNet as total 932,264 and peak
-    440,928, and the two numbers answer two different questions. Total is what
-    the whole forward pass produced. Peak is how much had to be resident at
-    once, and peak is the one that decides whether the model runs.
+    last_use = _last_use(graph)
 
-    Peak is not `max(out_elements)`. Three things make it larger than that:
+    # Live tensors are tracked in bytes.
+    live = {}
 
-      * a layer's input is still resident while its output is being written.
-        The live set at layer *i* contains both
-      * a tensor consumed by a later layer stays resident in between. `add`
-        layers name two inputs in `Layer.reads`, and the earlier one has been
-        sitting in memory across every layer of the block. This is the residual
-        connection and it is the single largest contributor to peak in
-        ResNet-shaped networks
-      * the network's own input is a tensor too
+    input_bytes = (
+        _elements(graph.input_shape)
+        * dtype_bytes(graph.precision)
+    )
 
-    The implementation is a liveness pass: work out the last layer that reads
-    each tensor, then walk forward keeping a live set and taking the maximum of
-    its total size. Anything simpler than that is wrong on any graph with a
-    skip connection, and it is wrong quietly, in the direction that says the
-    model fits.
+    live["__input__"] = input_bytes
 
-    Returns a `computed` finding whose value is peak *bytes*, because bytes are
-    what a memory budget is denominated in, with elements and the layer where
-    the peak occurs alongside.
-    """
-    pass
+    total_elements = 0
+    total_bytes = 0.0
+
+    peak_bytes = sum(live.values())
+    peak_at = "__input__"
+
+    for i, ly in enumerate(graph.layers):
+        out_elements = ly.out_elements
+        out_b = out_elements * dtype_bytes(ly.act_dtype)
+
+        # Add this layer's output to the live set.
+        live[ly.name] = out_b
+
+        # Total activation production excludes the network input.
+        total_elements += out_elements
+        total_bytes += out_b
+
+        # Calculate current resident memory.
+        resident = sum(live.values())
+
+        if resident > peak_bytes:
+            peak_bytes = resident
+            peak_at = ly.name
+
+        # Remove tensors whose final use occurs at this layer.
+        to_remove = []
+
+        for tensor, last_index in last_use.items():
+            if last_index == i and tensor in live:
+                to_remove.append(tensor)
+
+        for tensor in to_remove:
+            del live[tensor]
+
+    peak_elements = _peak_elements(graph, last_use)
+
+    return computed(
+        value=peak_bytes,
+        source="count_activations",
+        peak_bytes=peak_bytes,
+        peak_at=peak_at,
+        peak_elements=peak_elements,
+        total_elements=total_elements,
+        total_bytes=total_bytes,
+        includes_network_input=True,
+    )
+
+
+def _elements(shape: tuple[int, ...]) -> int:
+    """Return the number of elements represented by a shape."""
+
+    elements = 1
+
+    for dim in shape:
+        elements *= dim
+
+    return elements
+
+
+def _last_use(graph: Graph) -> dict[str, int]:
+    """Determine the last layer index at which each tensor is consumed."""
+
+    last = {}
+
+    for i, ly in enumerate(graph.layers):
+
+        # In graph.py, an unspecified reads field is represented by ().
+        # Therefore, use truthiness rather than `is not None`.
+        if ly.reads:
+            for tensor in ly.reads:
+                last[tensor] = i
+
+        else:
+            if i == 0:
+                # First layer consumes the network input.
+                last["__input__"] = 0
+            else:
+                # Sequential layer consumes the previous layer's output.
+                previous_name = graph.layers[i - 1].name
+                last[previous_name] = i
+
+        # If nobody consumes this layer's output, it dies where produced.
+        last.setdefault(ly.name, i)
+
+    # The final output remains alive until the end of the forward pass.
+    if graph.layers:
+        last[graph.layers[-1].name] = len(graph) - 1
+
+    return last
+
+
+def _peak_elements(
+    graph: Graph,
+    last_use: dict[str, int],
+) -> int:
+    """Calculate the maximum number of activation elements simultaneously live."""
+
+    live = {
+        "__input__": _elements(graph.input_shape)
+    }
+
+    peak = sum(live.values())
+
+    for i, ly in enumerate(graph.layers):
+
+        # Add this layer's output.
+        live[ly.name] = ly.out_elements
+
+        current = sum(live.values())
+
+        if current > peak:
+            peak = current
+
+        # Remove tensors whose final use is this layer.
+        to_remove = []
+
+        for tensor, last_index in last_use.items():
+            if last_index == i and tensor in live:
+                to_remove.append(tensor)
+
+        for tensor in to_remove:
+            del live[tensor]
+
+    return peak
+
 
 # ===========================================================================
-# 4. The factor of two that halves everybody's numbers
+# 4. MAC to FLOP conversion
 # ===========================================================================
 
-def to_flops(macs: dict[str, Any], convention: str = "mac_is_two_flops") -> dict[str, Any]:
-    """Convert a MAC finding to a FLOP finding, naming the convention used.
 
-    A multiply-accumulate is one multiply and one add, so it is two
-    floating-point operations. Roughly half the published literature calls a
-    MAC one FLOP anyway, and the two conventions differ by exactly the factor
-    that makes two papers' numbers incomparable.
+def to_flops(
+    macs: dict[str, Any],
+    convention: str = "mac_is_two_flops",
+) -> dict[str, Any]:
+    """Convert a MAC finding into a FLOP finding."""
 
-    Three requirements, and the third is the graded one:
+    # The MAC finding must contain a valid answer.
+    if not is_answered(macs):
+        return unknown(
+            "to_flops",
+            "no valid MAC count was provided",
+        )
 
-      * multiply once. `FLOPS_PER_MAC` exists so that the number 2 appears in
-        this file exactly once
-      * an unknown MAC count converts to an unknown FLOP count. It does not
-        convert to zero and it does not raise
-      * the convention goes in the finding. A FLOP count that does not say
-        which convention produced it is not a FLOP count, it is a number, and
-        `to_flops(x, "mac_is_one_flop")` has to be as clearly labelled as the
-        default
+    # Do not silently assume a convention we do not recognize.
+    if convention not in FLOP_CONVENTIONS:
+        return unknown(
+            "to_flops",
+            f"unrecognized convention '{convention}'; "
+            f"allowed options: {list(FLOP_CONVENTIONS.keys())}",
+        )
 
-    An unrecognised convention is `unknown`, not a default. The caller asked
-    for something this function does not know how to do.
-    """
-    pass
+    factor = FLOP_CONVENTIONS[convention]
+
+    total_flops = macs["value"] * factor
+
+    # Convert per-layer MAC counts if they are available.
+    per_layer = {}
+
+    if "per_layer" in macs:
+        for layer_name, layer_macs in macs["per_layer"].items():
+            per_layer[layer_name] = layer_macs * factor
+
+    return computed(
+        value=total_flops,
+        source=macs["source"],
+        convention=convention,
+        flops_per_mac=factor,
+        per_layer=per_layer,
+    )
