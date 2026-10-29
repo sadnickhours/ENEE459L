@@ -333,3 +333,113 @@ def to_flops(
         flops_per_mac=factor,
         per_layer=per_layer,
     )
+    
+    
+def _layer_macs(ly: Layer) -> int:
+    """Estimate the number of multiply-accumulate operations for one layer."""
+
+    if ly.kind == "conv":
+        cin = ly.in_shape[0]
+        cout = ly.out_shape[0]
+
+        if ly.kernel is None:
+            kh, kw = 1, 1
+        else:
+            kh, kw = ly.kernel
+
+        cin_per_group = cin // ly.groups
+
+        return ly.out_elements * cin_per_group * kh * kw
+
+    elif ly.kind == "linear":
+        return ly.in_elements * ly.out_elements
+
+    else:
+        return 0
+
+
+def arithmetic_intensity(graph: Graph) -> dict[str, Any]:
+    """Calculate per-layer and whole-model arithmetic intensity."""
+
+    per_layer = {}
+    total_flops = 0
+    total_bytes = 0.0
+
+    for i, ly in enumerate(graph.layers):
+        # Resolve the dtype of the incoming activation tensor.
+        if ly.reads:
+            producer = graph.get(ly.reads[0])
+            in_dtype = (
+                producer.act_dtype if producer is not None
+                else graph.precision
+            )
+        elif i > 0:
+            in_dtype = graph.layers[i - 1].act_dtype
+        else:
+            in_dtype = graph.precision
+
+        # Input activation memory traffic.
+        input_elements = ly.in_elements
+
+        if ly.kind == "add" and len(ly.reads) == 2:
+            input_elements *= 2
+
+        input_bytes = input_elements * dtype_bytes(in_dtype)
+
+        # Learnable parameters and persistent BatchNorm buffers.
+        weight_bytes = (
+            _layer_parameters(ly) * dtype_bytes(ly.weight_dtype)
+        )
+
+        buffer_bytes = 0.0
+        if ly.kind == "bn":
+            buffer_bytes = (
+                BN_BUFFERS_PER_CHANNEL
+                * ly.out_shape[0]
+                * dtype_bytes(BUFFER_DTYPE)
+            )
+
+        # Output activation memory traffic.
+        output_bytes = (
+            ly.out_elements * dtype_bytes(ly.act_dtype)
+        )
+
+        bytes_moved = (
+            input_bytes + weight_bytes + buffer_bytes + output_bytes
+        )
+
+        # One MAC counts as two FLOPs.
+        flops = _layer_macs(ly) * FLOPS_PER_MAC
+
+        intensity = (
+            round(flops / bytes_moved, 4)
+            if bytes_moved != 0
+            else 0.0
+        )
+
+        per_layer[ly.name] = {
+            "flops": flops,
+            "bytes": float(bytes_moved),
+            "intensity": intensity,
+        }
+
+        total_flops += flops
+        total_bytes += bytes_moved
+
+    model_intensity = (
+        round(total_flops / total_bytes, 4)
+        if total_bytes != 0
+        else 0.0
+    )
+
+    return computed(
+        value=model_intensity,
+        source="arithmetic_intensity",
+        message=f"{graph.name}: FLOPs over bytes, every byte counted once",
+        per_layer=per_layer,
+        total_flops=total_flops,
+        total_bytes=float(total_bytes),
+        flops_per_mac=FLOPS_PER_MAC,
+        cache_reuse_assumed=False,
+        note="no fusion and no cache reuse; both would lower the byte column",
+    )
