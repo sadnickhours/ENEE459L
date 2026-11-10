@@ -62,8 +62,6 @@ def detect_faces(image_path, output_path="output_detected.png", conf_threshold=0
                                    providers=available_providers or ['CPUExecutionProvider'])
     input_name = session.get_inputs()[0].name
     outputs = session.run(None, {input_name: tensor})
-    print("Boxes shape:", np.asarray(outputs[0]).shape)
-    print("Scores shape:", np.asarray(outputs[1]).shape)
 
     scores = np.asarray(outputs[0]).reshape(-1, 2)[:, 1]
     boxes = np.asarray(outputs[1]).reshape(-1, 4)
